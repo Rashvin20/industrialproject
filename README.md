@@ -11,7 +11,7 @@ Satellite imagery plays a vital role in industries like **agriculture**, **urban
 This project aims to **bridge the resolution gap** using deep learning-based **Super-Resolution (SR)** techniques — enabling accurate visual interpretation without relying on expensive HR datasets.
 
 ### 🚀 Collaborating Partner  
-**Knight Frank**, a global real estate firm managing over **$817B** in assets, is supporting this project. They rely on geospatial data for **property valuation**, **risk assessment**, and **site analysis**, all of which benefit greatly from enhanced satellite imagery.
+**Knight Frank**, a global real estate firm , is supporting this project. They rely on geospatial data for **property valuation**, **risk assessment**, and **site analysis**, all of which benefit greatly from enhanced satellite imagery.
 
 ---
 
