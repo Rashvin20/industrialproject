@@ -46,6 +46,6 @@ For prototyping, we use **CIFAR-10** resized to mimic satellite imagery. Future 
 ## 🛠️ Setup & Installation
 
 ```bash
-git clone https://github.com/your-username/satellite-super-resolution.git
-cd satellite-super-resolution
+git clone [https://github.com/Rashvin20/industrialproject.git]
+cd industrialproject
 pip install -r requirements.txt
