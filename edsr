@@ -2,14 +2,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from torchvision import datasets, transforms
-import torchvision.transforms.functional as TF
-from torchvision.transforms import InterpolationMode
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
+import rasterio as rio
+import tacoreader
 
-# Define the EDSR Model
+# EDSR Model Definition
 class EDSR(nn.Module):
     def __init__(self, scale=2):
         super(EDSR, self).__init__()
@@ -26,95 +25,81 @@ class EDSR(nn.Module):
         x = self.pixel_shuffle(x)
         return x
 
-# Dataset class to handle CIFAR10
-class CIFAR10_SR(Dataset):
-    def __init__(self, train=True, scale=2, hr_size=64, max_samples=1000):
-        self.dataset = datasets.CIFAR10(root='./data', train=train, download=True)
-        self.hr_size = hr_size  # High-resolution target size
+# Custom Dataset using Sen2Naip
+class Sen2NaipDataset(Dataset):
+    def __init__(self, split="tacofoundation:sen2naipv2-crosssensor", indices=None, patch_size=64, scale=2, max_samples=100):
+        self.dataset = tacoreader.load(split)
+        self.indices = indices if indices else range(min(len(self.dataset), max_samples))
+        self.patch_size = patch_size
         self.scale = scale
-        self.max_samples = max_samples  # Limit the number of samples for quick testing
-        self.to_tensor = transforms.ToTensor()
-
-    def __getitem__(self, idx):
-        img, _ = self.dataset[idx]
-        # Resize to create high-resolution (HR) target
-        hr = TF.resize(img, [self.hr_size, self.hr_size], interpolation=InterpolationMode.BICUBIC)
-        hr = self.to_tensor(hr)
-
-        # Downscale to create low-resolution (LR) input
-        lr = TF.resize(hr, [self.hr_size // self.scale, self.hr_size // self.scale], interpolation=InterpolationMode.BICUBIC)
-        lr = TF.resize(lr, [self.hr_size, self.hr_size], interpolation=InterpolationMode.BICUBIC)
-
-        return lr, hr
+        self.hr_patch_size = patch_size * scale
 
     def __len__(self):
-        # Limit the dataset size for quick testing
-        return min(len(self.dataset), self.max_samples)
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        sample_idx = self.indices[idx]
+        lr_ref = self.dataset.read(sample_idx).read(0)
+        hr_ref = self.dataset.read(sample_idx).read(1)
+
+        with rio.open(lr_ref) as src_lr, rio.open(hr_ref) as src_hr:
+            lr_data = src_lr.read(window=rio.windows.Window(0, 0, self.patch_size, self.patch_size))
+            hr_data = src_hr.read(window=rio.windows.Window(0, 0, self.hr_patch_size, self.hr_patch_size))
+
+        lr_tensor = self.to_tensor(lr_data)
+        hr_tensor = self.to_tensor(hr_data)
+        return lr_tensor, hr_tensor
+
+    def to_tensor(self, data, norm=3000.0):
+        data = np.clip(data[:3], 0, norm) / norm  # normalize RGB only
+        return torch.tensor(data, dtype=torch.float32)
 
 # PSNR Calculation
+
 def calculate_psnr(sr_img, hr_img, max_value=1.0):
     mse = F.mse_loss(sr_img, hr_img)
     psnr = 20 * torch.log10(max_value / torch.sqrt(mse))
     return psnr
 
-# Training function
-def train_model(model, dataloader, num_epochs=2, lr=1e-4):  # Reduce epochs to 2 for quick testing
-    criterion = nn.L1Loss()  # L1 loss for super-resolution
+# Training Function
+def train_model(model, dataloader, num_epochs=5, lr=1e-4):
+    criterion = nn.L1Loss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # Check for GPU availability
-    model.to(device)  # Move the model to the available device
-    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        
+
         for lr_imgs, hr_imgs in dataloader:
-            # Move images to the device (GPU or CPU)
             lr_imgs, hr_imgs = lr_imgs.to(device), hr_imgs.to(device)
 
-            # Resize the high-resolution images to match the output size of the model
-            hr_imgs_resized = F.interpolate(hr_imgs, size=(lr_imgs.size(2) * scale, lr_imgs.size(3) * scale), mode='bicubic', align_corners=False)
+            hr_imgs_resized = F.interpolate(hr_imgs, size=(lr_imgs.size(2) * model.scale, lr_imgs.size(3) * model.scale), mode='bicubic', align_corners=False)
 
-            # Zero the parameter gradients
             optimizer.zero_grad()
-
-            # Forward pass
             sr_imgs = model(lr_imgs)
-
-            # Calculate loss
             loss = criterion(sr_imgs, hr_imgs_resized)
             loss.backward()
-
-            # Update weights
             optimizer.step()
-
-            # Track the running loss
             running_loss += loss.item()
 
-        # Print statistics
-        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss / len(dataloader):.4f}')
-        
-        # After every epoch, calculate PSNR and display comparison images
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss / len(dataloader):.4f}")
+
         with torch.no_grad():
             model.eval()
             for lr_imgs, hr_imgs in dataloader:
                 lr_imgs, hr_imgs = lr_imgs.to(device), hr_imgs.to(device)
                 sr_imgs = model(lr_imgs)
 
-                # Resize the super-resolved images to the same size as high-resolution images
                 sr_imgs_resized = F.interpolate(sr_imgs, size=(hr_imgs.size(2), hr_imgs.size(3)), mode='bicubic', align_corners=False)
-
-                # Calculate PSNR
                 psnr_value = calculate_psnr(sr_imgs_resized, hr_imgs)
                 print(f"PSNR: {psnr_value.item():.4f} dB")
 
-                # Display the images
                 sr_img = sr_imgs_resized[0].cpu().clamp(0, 1).numpy().transpose(1, 2, 0)
                 lr_img = lr_imgs[0].cpu().clamp(0, 1).numpy().transpose(1, 2, 0)
                 hr_img = hr_imgs[0].cpu().clamp(0, 1).numpy().transpose(1, 2, 0)
 
-                # Plot comparison
                 plt.figure(figsize=(12, 4))
                 plt.subplot(1, 3, 1)
                 plt.imshow(lr_img)
@@ -132,18 +117,15 @@ def train_model(model, dataloader, num_epochs=2, lr=1e-4):  # Reduce epochs to 2
                 plt.axis('off')
 
                 plt.show()
+                break
 
-                break  # Display only one batch per epoch for quick testing
-
-# Set up data loader with limited samples and smaller batch size
+# Load dataset and train
 scale = 2
-train_dataset = CIFAR10_SR(train=True, scale=scale, hr_size=64, max_samples=100)  # Use only 100 samples for testing
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)  # Use smaller batch size
+train_dataset = Sen2NaipDataset(scale=scale, patch_size=64, max_samples=100)
+train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
 
-# Initialize and train the model
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = EDSR(scale=scale).to(device)
-train_model(model, train_loader, num_epochs=5)  # Set epochs to 2 for quick testing
+model = EDSR(scale=scale)
+train_model(model, train_loader, num_epochs=2)
 
-# Save the trained model
-torch.save(model.state_dict(), "edsr_model.pth")
+# Save model
+torch.save(model.state_dict(), "edsr_model_sen2naip.pth")
