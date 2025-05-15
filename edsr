@@ -1,35 +1,21 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import numpy as np
-import rasterio as rio
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 import tacoreader
+import rasterio as rio
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+import math
+import os
 
-# EDSR Model Definition
-class EDSR(nn.Module):
-    def __init__(self, scale=2):
-        super(EDSR, self).__init__()
-        self.scale = scale
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(64, 3 * (scale ** 2), kernel_size=3, padding=1)
-        self.pixel_shuffle = nn.PixelShuffle(scale)
-
-    def forward(self, x):
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = self.conv3(x)
-        x = self.pixel_shuffle(x)
-        return x
-
-# Custom Dataset using Sen2Naip
+# ---------- 1. Dataset ----------
 class Sen2NaipDataset(Dataset):
-    def __init__(self, split="tacofoundation:sen2naipv2-crosssensor", indices=None, patch_size=64, scale=2, max_samples=100):
+    def __init__(self, split="tacofoundation:sen2naipv2-unet", indices=None, patch_size=64, scale=4):
         self.dataset = tacoreader.load(split)
-        self.indices = indices if indices else range(min(len(self.dataset), max_samples))
+        self.indices = indices if indices else range(len(self.dataset))
         self.patch_size = patch_size
         self.scale = scale
         self.hr_patch_size = patch_size * scale
@@ -46,86 +32,125 @@ class Sen2NaipDataset(Dataset):
             lr_data = src_lr.read(window=rio.windows.Window(0, 0, self.patch_size, self.patch_size))
             hr_data = src_hr.read(window=rio.windows.Window(0, 0, self.hr_patch_size, self.hr_patch_size))
 
-        lr_tensor = self.to_tensor(lr_data)
-        hr_tensor = self.to_tensor(hr_data)
-        return lr_tensor, hr_tensor
+        return self.to_tensor_gray(lr_data), self.to_tensor_gray(hr_data)
 
-    def to_tensor(self, data, norm=3000.0):
-        data = np.clip(data[:3], 0, norm) / norm  # normalize RGB only
-        return torch.tensor(data, dtype=torch.float32)
+    def to_tensor_gray(self, data, norm=3000.0):
+        rgb = data[:3] / norm
+        gray = 0.2989 * rgb[0] + 0.5870 * rgb[1] + 0.1140 * rgb[2]
+        return torch.tensor(gray, dtype=torch.float32).unsqueeze(0)  # [1, H, W]
 
-# PSNR Calculation
 
-def calculate_psnr(sr_img, hr_img, max_value=1.0):
-    mse = F.mse_loss(sr_img, hr_img)
-    psnr = 20 * torch.log10(max_value / torch.sqrt(mse))
-    return psnr
+# ---------- 2. Model (EDSR) ----------
+class ResidualBlock(nn.Module):
+    def __init__(self, channels=64):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1)
+        )
 
-# Training Function
-def train_model(model, dataloader, num_epochs=5, lr=1e-4):
-    criterion = nn.L1Loss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
+    def forward(self, x):
+        return x + self.block(x)
+
+
+class EDSR(nn.Module):
+    def __init__(self, scale=4, num_res_blocks=8):
+        super(EDSR, self).__init__()
+        self.scale = scale
+        self.head = nn.Conv2d(1, 64, kernel_size=3, padding=1)
+        self.body = nn.Sequential(*[ResidualBlock(64) for _ in range(num_res_blocks)])
+        self.tail = nn.Sequential(
+            nn.Conv2d(64, 1 * (scale ** 2), kernel_size=3, padding=1),
+            nn.PixelShuffle(scale)
+        )
+
+    def forward(self, x):
+        x = self.head(x)
+        x = self.body(x)
+        x = self.tail(x)
+        return x
+
+
+# ---------- 3. Training ----------
+def compute_psnr(output, target, max_pixel=1.0):
+    mse = torch.mean((output - target) ** 2)
+    return 100 if mse == 0 else 20 * math.log10(max_pixel / math.sqrt(mse))
+
+def train_model(model, dataloader, device, num_epochs=5, save_path="edsr_epoch"):
+    print("Begin Training")
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
 
-        for lr_imgs, hr_imgs in dataloader:
-            lr_imgs, hr_imgs = lr_imgs.to(device), hr_imgs.to(device)
-
-            hr_imgs_resized = F.interpolate(hr_imgs, size=(lr_imgs.size(2) * model.scale, lr_imgs.size(3) * model.scale), mode='bicubic', align_corners=False)
+        for i, (lr, hr) in enumerate(dataloader):
+            lr, hr = lr.to(device), hr.to(device)
 
             optimizer.zero_grad()
-            sr_imgs = model(lr_imgs)
-            loss = criterion(sr_imgs, hr_imgs_resized)
+            output = model(lr)
+            loss = criterion(output, hr)
             loss.backward()
             optimizer.step()
+
             running_loss += loss.item()
+            if (i + 1) % 100 == 0:
+                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}], Loss: {running_loss/100:.4f}")
+                running_loss = 0.0
 
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss / len(dataloader):.4f}")
+        psnr = compute_psnr(output, hr)
+        print(f"Epoch [{epoch+1}], PSNR: {psnr:.2f} dB")
 
-        with torch.no_grad():
-            model.eval()
-            for lr_imgs, hr_imgs in dataloader:
-                lr_imgs, hr_imgs = lr_imgs.to(device), hr_imgs.to(device)
-                sr_imgs = model(lr_imgs)
+        if (epoch + 1) % 5 == 0:
+            torch.save(model.state_dict(), f"{save_path}_{epoch+1}.pth")
+            print(f"Model saved as: {save_path}_{epoch+1}.pth")
 
-                sr_imgs_resized = F.interpolate(sr_imgs, size=(hr_imgs.size(2), hr_imgs.size(3)), mode='bicubic', align_corners=False)
-                psnr_value = calculate_psnr(sr_imgs_resized, hr_imgs)
-                print(f"PSNR: {psnr_value.item():.4f} dB")
 
-                sr_img = sr_imgs_resized[0].cpu().clamp(0, 1).numpy().transpose(1, 2, 0)
-                lr_img = lr_imgs[0].cpu().clamp(0, 1).numpy().transpose(1, 2, 0)
-                hr_img = hr_imgs[0].cpu().clamp(0, 1).numpy().transpose(1, 2, 0)
+# ---------- 4. Inference & Visualization ----------
+def test_random_sample(model, dataset, device):
+    model.eval()
+    idx = random.randint(0, len(dataset) - 1)
+    lr, hr = dataset[idx]
 
-                plt.figure(figsize=(12, 4))
-                plt.subplot(1, 3, 1)
-                plt.imshow(lr_img)
-                plt.title("Low Resolution")
-                plt.axis('off')
+    lr = lr.unsqueeze(0).to(device)
+    hr = hr.unsqueeze(0).to(device)
 
-                plt.subplot(1, 3, 2)
-                plt.imshow(hr_img)
-                plt.title("High Resolution")
-                plt.axis('off')
+    with torch.no_grad():
+        sr = model(lr)
 
-                plt.subplot(1, 3, 3)
-                plt.imshow(sr_img)
-                plt.title(f"Super-Resolved (PSNR: {psnr_value.item():.2f} dB)")
-                plt.axis('off')
+    lr_np = lr.squeeze().cpu().numpy()
+    hr_np = hr.squeeze().cpu().numpy()
+    sr_np = sr.squeeze().cpu().numpy()
 
-                plt.show()
-                break
+    plt.figure(figsize=(15, 5))
+    titles = ['Low-Resolution (Input)', 'High-Resolution (Ground Truth)', 'EDSR Output']
+    for i, img in enumerate([lr_np, hr_np, sr_np]):
+        plt.subplot(1, 3, i + 1)
+        plt.imshow(img, cmap='gray')
+        plt.title(titles[i])
+        plt.axis('off')
+    plt.tight_layout()
+    plt.show()
 
-# Load dataset and train
-scale = 2
-train_dataset = Sen2NaipDataset(scale=scale, patch_size=64, max_samples=100)
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
 
-model = EDSR(scale=scale)
-train_model(model, train_loader, num_epochs=2)
+# ---------- 5. Entrypoint ----------
+def main(train=True, model_path="edsr_epoch_10.pth"):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = EDSR(scale=4).to(device)
 
-# Save model
-torch.save(model.state_dict(), "edsr_model_sen2naip.pth")
+    if train:
+        train_dataset = Sen2NaipDataset(indices=range(100))
+        train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+        train_model(model, train_loader, device)
+    else:
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model weights not found at {model_path}")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        test_dataset = Sen2NaipDataset(indices=range(10))
+        test_random_sample(model, test_dataset, device)
+
+# Run training or testing
+# main(train=True)
+main(train=True)
