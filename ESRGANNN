@@ -1,0 +1,169 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import tacoreader
+import rasterio as rio
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+import math
+import os
+
+# ---------- 1. Dataset (Unchanged) ----------
+class Sen2NaipDataset(Dataset):
+    def __init__(self, split="tacofoundation:sen2naipv2-unet", indices=None, patch_size=64, scale=4):
+        self.dataset = tacoreader.load(split)
+        self.indices = indices if indices else range(len(self.dataset))
+        self.patch_size = patch_size
+        self.scale = scale
+        self.hr_patch_size = patch_size * scale
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        sample_idx = self.indices[idx]
+        lr_ref = self.dataset.read(sample_idx).read(0)
+        hr_ref = self.dataset.read(sample_idx).read(1)
+
+        with rio.open(lr_ref) as src_lr, rio.open(hr_ref) as src_hr:
+            lr_data = src_lr.read(window=rio.windows.Window(0, 0, self.patch_size, self.patch_size))
+            hr_data = src_hr.read(window=rio.windows.Window(0, 0, self.hr_patch_size, self.hr_patch_size))
+
+        return self.to_tensor_gray(lr_data), self.to_tensor_gray(hr_data)
+
+    def to_tensor_gray(self, data, norm=3000.0):
+        rgb = data[:3] / norm
+        gray = 0.2989 * rgb[0] + 0.5870 * rgb[1] + 0.1140 * rgb[2]
+        return torch.tensor(gray, dtype=torch.float32).unsqueeze(0)
+
+
+# ---------- 2. ESRGAN Generator ----------
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.PReLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels)
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+class ESRGANGenerator(nn.Module):
+    def __init__(self, num_res_blocks=16):
+        super(ESRGANGenerator, self).__init__()
+        self.initial = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=9, padding=4),
+            nn.PReLU()
+        )
+
+        self.residuals = nn.Sequential(*[ResidualBlock(64) for _ in range(num_res_blocks)])
+
+        self.mid = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64)
+        )
+
+        self.upsample = nn.Sequential(
+            nn.Conv2d(64, 256, kernel_size=3, padding=1),
+            nn.PixelShuffle(2),
+            nn.PReLU(),
+            nn.Conv2d(64, 256, kernel_size=3, padding=1),
+            nn.PixelShuffle(2),
+            nn.PReLU()
+        )
+
+        self.final = nn.Conv2d(64, 1, kernel_size=9, padding=4)
+
+    def forward(self, x):
+        initial = self.initial(x)
+        res = self.residuals(initial)
+        mid = self.mid(res)
+        combined = initial + mid
+        upsampled = self.upsample(combined)
+        return self.final(upsampled)
+
+
+# ---------- 3. Training ----------
+def compute_psnr(output, target, max_pixel=1.0):
+    mse = torch.mean((output - target) ** 2)
+    return 100 if mse == 0 else 20 * math.log10(max_pixel / math.sqrt(mse))
+
+def train_esrgan(model, dataloader, device, num_epochs=5, save_path="esrgan_epoch"):
+    print("Begin ESRGAN Training")
+    criterion = nn.L1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+
+        for i, (lr, hr) in enumerate(dataloader):
+            lr, hr = lr.to(device), hr.to(device)
+            optimizer.zero_grad()
+            output = model(lr)
+            loss = criterion(output, hr)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            if (i + 1) % 10 == 0:
+                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}], Loss: {running_loss/10:.4f}")
+                running_loss = 0.0
+
+        psnr = compute_psnr(output, hr)
+        print(f"Epoch [{epoch+1}], PSNR: {psnr:.2f} dB")
+
+        if (epoch + 1) % 5 == 0:
+            torch.save(model.state_dict(), f"{save_path}_{epoch+1}.pth")
+            print(f"Model saved: {save_path}_{epoch+1}.pth")
+
+
+# ---------- 4. Inference ----------
+def test_esrgan(model, dataset, device):
+    model.eval()
+    idx = random.randint(0, len(dataset) - 1)
+    lr, hr = dataset[idx]
+    lr = lr.unsqueeze(0).to(device)
+    hr = hr.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        sr = model(lr)
+
+    # Plot
+    plt.figure(figsize=(15, 5))
+    for i, img in enumerate([lr.squeeze().cpu().numpy(), hr.squeeze().cpu().numpy(), sr.squeeze().cpu().numpy()]):
+        plt.subplot(1, 3, i + 1)
+        plt.imshow(img, cmap='gray')
+        plt.title(['LR Input', 'HR Ground Truth', 'SR Output'][i])
+        plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+# ---------- 5. Entrypoint ----------
+def main(train=True, model_path="esrgan_epoch_5.pth"):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ESRGANGenerator().to(device)
+
+    if train:
+        train_dataset = Sen2NaipDataset(indices=range(5)) #100
+        train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+        train_esrgan(model, train_loader, device)
+    else:
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model not found at {model_path}")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+
+        test_dataset = Sen2NaipDataset(indices=range(1)) #10
+        test_esrgan(model, test_dataset, device)
+
+# Run it
+# main(train=True)
+main(train=True)
