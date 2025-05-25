@@ -32,29 +32,39 @@ class Sen2NaipDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        sample_idx = self.indices[idx]
-        try:
-            lr_ref = self.dataset.read(sample_idx).read(0)
-            hr_ref = self.dataset.read(sample_idx).read(1)
+        for attempt in range(5):
+            sample_idx = random.randint(0, len(self.indices) - 1) if attempt > 0 else self.indices[idx]
+            try:
+                lr_ref = self.dataset.read(sample_idx).read(0)
+                hr_ref = self.dataset.read(sample_idx).read(1)
 
-            with rio.open(lr_ref) as src_lr, rio.open(hr_ref) as src_hr:
-                w_lr, h_lr = src_lr.width, src_lr.height
-                w_hr, h_hr = src_hr.width, src_hr.height
+                with rio.open(lr_ref) as src_lr, rio.open(hr_ref) as src_hr:
+                    w_lr, h_lr = src_lr.width, src_lr.height
+                    w_hr, h_hr = src_hr.width, src_hr.height
 
-                if w_lr < self.patch_size or h_lr < self.patch_size or w_hr < self.hr_patch_size or h_hr < self.hr_patch_size:
-                    raise ValueError("Patch too small in sample")
+                    if w_lr < self.patch_size or h_lr < self.patch_size or w_hr < self.hr_patch_size or h_hr < self.hr_patch_size:
+                        raise ValueError("Patch too small in sample")
 
-                lr_data = src_lr.read(window=rio.windows.Window(0, 0, self.patch_size, self.patch_size))
-                hr_data = src_hr.read(window=rio.windows.Window(0, 0, self.hr_patch_size, self.hr_patch_size))
+                    lr_data = src_lr.read(window=rio.windows.Window(0, 0, self.patch_size, self.patch_size))
+                    hr_data = src_hr.read(window=rio.windows.Window(0, 0, self.hr_patch_size, self.hr_patch_size))
 
-        except Exception as e:
-            print(f"[WARNING] Skipping sample {sample_idx} due to: {e}")
-            return self[random.randint(0, len(self) - 1)]
+                    if self.color:
+                        return self.to_tensor_rgb(lr_data), self.to_tensor_rgb(hr_data)
+                    else:
+                        return self.to_tensor_gray(lr_data), self.to_tensor_gray(hr_data)
 
-        if self.color:
-            return self.to_tensor_rgb(lr_data), self.to_tensor_rgb(hr_data)
-        else:
-            return self.to_tensor_gray(lr_data), self.to_tensor_gray(hr_data)
+            except Exception as e:
+                time.sleep(5) 
+                print(f"[WARNING] Skipping sample {sample_idx} (attempt {attempt+1}): {e}")
+                continue
+
+        # If all retries fail, return a dummy black image pair
+        print(f"[ERROR] Sample at index {idx} failed after 5 attempts. Returning blank tensors.")
+        c = 3 if self.color else 1
+        lr_dummy = torch.zeros((c, self.patch_size, self.patch_size), dtype=torch.float32)
+        hr_dummy = torch.zeros((c, self.hr_patch_size, self.hr_patch_size), dtype=torch.float32)
+        return lr_dummy, hr_dummy
+
 
     def to_tensor_gray(self, data, norm=3000.0):
         rgb = data[:3] / norm
@@ -124,7 +134,7 @@ def compute_ssim(output, target):
     target_np = target.squeeze().detach().cpu().numpy().transpose(1, 2, 0)
     return compare_ssim(output_np, target_np, data_range=1.0, channel_axis=-1)
 
-def train_model(model, dataloader, device, num_epochs=6, save_path="edsr_epoch"):
+def train_model(model, dataloader, device, num_epochs=100, save_path="edsr_epoch"):
     print("Begin Training")
     criterion_pixel = nn.MSELoss()
     criterion_percep = PerceptualLoss().to(device)
@@ -144,7 +154,7 @@ def train_model(model, dataloader, device, num_epochs=6, save_path="edsr_epoch")
         perceptual_accum = 0.0
 
         for i, (lr, hr) in enumerate(dataloader):
-            time.sleep(1)
+            time.sleep(2)
             lr, hr = lr.to(device), hr.to(device)
 
             optimizer.zero_grad()
@@ -180,7 +190,7 @@ def train_model(model, dataloader, device, num_epochs=6, save_path="edsr_epoch")
             "perceptual_loss": avg_percep
         })
 
-        if (epoch + 1) % 6 == 0:
+        if (epoch + 1) % 10 == 0:
             torch.save(model.state_dict(), f"{save_path}_{epoch+1}.pth")
             print(f"Model saved as: {save_path}_{epoch+1}.pth")
 
@@ -221,8 +231,6 @@ def test_random_sample(model, dataset, device, save_name="edsr_sample_output.png
     lr_np = lr.squeeze().cpu().numpy().transpose(1, 2, 0)
     hr_np = hr.squeeze().cpu().numpy().transpose(1, 2, 0)
     sr_np = sr.squeeze().cpu().numpy().transpose(1, 2, 0)
-
-    plt.figure(figsize=(15, 5))
     titles = ['Low-Resolution (Input)', 'High-Resolution (Ground Truth)', 'EDSR Output']
     for i, img in enumerate([lr_np, hr_np, sr_np]):
         plt.subplot(1, 3, i + 1)
@@ -244,7 +252,7 @@ def main(train=True, model_path="edsr_epoch_6.pth"):
 
     if train:
         print("Loading training dataset...")
-        train_dataset = Sen2NaipDataset(indices=range(50), color=True)
+        train_dataset = Sen2NaipDataset(indices=range(200), color=True)
         train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0)
         print("Starting model training...")
         train_model(model, train_loader, device)
@@ -258,4 +266,5 @@ def main(train=True, model_path="edsr_epoch_6.pth"):
         test_random_sample(model, test_dataset, device)
 
 # Run training or testing
-main(train=True)
+if __name__ == "__main__":
+    main(train=True)
