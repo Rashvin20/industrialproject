@@ -15,10 +15,10 @@ from torchvision.models import vgg19, VGG19_Weights
 from skimage.metrics import structural_similarity as compare_ssim
 import wandb
 
-# ---------- Initialize Weights & Biases ----------
+# connect to weight and biases website
 wandb.init(project="edsr-super-resolution", name="edsr-perceptual-run")
 
-# ---------- 1. Dataset ----------
+# loading dataset
 class Sen2NaipDataset(Dataset):
     def __init__(self, split="tacofoundation:sen2naipv2-unet", indices=None, patch_size=64, scale=4, color=True):
         self.dataset = tacoreader.load(split)
@@ -58,7 +58,7 @@ class Sen2NaipDataset(Dataset):
                 print(f"[WARNING] Skipping sample {sample_idx} (attempt {attempt+1}): {e}")
                 continue
 
-        # If all retries fail, return a dummy black image pair
+        # to avoid crash during a long run 
         print(f"[ERROR] Sample at index {idx} failed after 5 attempts. Returning blank tensors.")
         c = 3 if self.color else 1
         lr_dummy = torch.zeros((c, self.patch_size, self.patch_size), dtype=torch.float32)
@@ -76,7 +76,7 @@ class Sen2NaipDataset(Dataset):
         return torch.tensor(rgb, dtype=torch.float32)
 
 
-# ---------- 2. Model (EDSR) ----------
+# defining the model
 class ResidualBlock(nn.Module):
     def __init__(self, channels=64):
         super().__init__()
@@ -108,7 +108,7 @@ class EDSR(nn.Module):
         return x
 
 
-# ---------- 3. Perceptual Loss ----------
+# defining the perceptual loss
 class PerceptualLoss(nn.Module):
     def __init__(self, layer_index=16):
         super().__init__()
@@ -124,7 +124,7 @@ class PerceptualLoss(nn.Module):
         return F.mse_loss(self.vgg(sr_resized), self.vgg(hr_resized))
 
 
-# ---------- 4. Training ----------
+# computing the metrics
 def compute_psnr(output, target, max_pixel=1.0):
     mse = torch.mean((output - target) ** 2)
     return 100 if mse.item() == 0 else 20 * math.log10(max_pixel / math.sqrt(mse.item()))
@@ -133,7 +133,7 @@ def compute_ssim(output, target):
     output_np = output.squeeze().detach().cpu().numpy().transpose(1, 2, 0)
     target_np = target.squeeze().detach().cpu().numpy().transpose(1, 2, 0)
     return compare_ssim(output_np, target_np, data_range=1.0, channel_axis=-1)
-
+# training the model
 def train_model(model, dataloader, device, num_epochs=100, save_path="edsr_epoch"):
     print("Begin Training")
     criterion_pixel = nn.MSELoss()
@@ -193,7 +193,7 @@ def train_model(model, dataloader, device, num_epochs=100, save_path="edsr_epoch
         if (epoch + 1) % 10 == 0:
             torch.save(model.state_dict(), f"{save_path}_{epoch+1}.pth")
             print(f"Model saved as: {save_path}_{epoch+1}.pth")
-
+#plotting the results
     def plot_and_save(values, ylabel, title, filename):
         plt.figure()
         plt.plot(range(1, num_epochs+1), values)
@@ -216,7 +216,7 @@ def train_model(model, dataloader, device, num_epochs=100, save_path="edsr_epoch
     test_random_sample(model, dataloader.dataset, device, save_name=save_name)
 
 
-# ---------- 5. Inference & Visualization ----------
+# testing on a random sample
 def test_random_sample(model, dataset, device, save_name="edsr_sample_output.png"):
     model.eval()
     idx = random.randint(0, len(dataset) - 1)
@@ -243,7 +243,7 @@ def test_random_sample(model, dataset, device, save_name="edsr_sample_output.png
     return lr_np, hr_np, sr_np
 
 
-# ---------- 6. Entrypoint ----------
+# our main function
 def main(train=True, model_path="edsr_epoch_6.pth"):
     print("Launching main training/testing procedure...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -265,6 +265,6 @@ def main(train=True, model_path="edsr_epoch_6.pth"):
         print("Running inference on test sample...")
         test_random_sample(model, test_dataset, device)
 
-# Run training or testing
+#to test turn training false
 if __name__ == "__main__":
     main(train=True)
