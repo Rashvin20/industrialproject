@@ -1,0 +1,214 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import tacoreader
+import rasterio as rio
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+import math
+import os
+from torchvision.models import squeezenet1_0, SqueezeNet1_0_Weights
+
+class PerceptualLoss(nn.Module):
+    def __init__(self, device):
+        super(PerceptualLoss, self).__init__()
+        weights = SqueezeNet1_0_Weights.DEFAULT
+        model = squeezenet1_0(weights=weights).features[:5]
+        self.features = model.to(device)
+        self.features.eval()
+        for param in self.features.parameters():
+            param.requires_grad = False
+
+    def forward(self, x, y):
+        return F.l1_loss(self.features(x), self.features(y))
+
+
+# ---------- 1. Dataset ----------
+class Sen2NaipDataset(Dataset):
+    def __init__(self, split="tacofoundation:sen2naipv2-unet", indices=None, patch_size=64, scale=4, color=False):
+        self.dataset = tacoreader.load(split)
+        self.indices = indices if indices else range(len(self.dataset))
+        self.patch_size = patch_size
+        self.scale = scale
+        self.color = color
+        self.hr_patch_size = patch_size * scale
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        sample_idx = self.indices[idx]
+        lr_ref = self.dataset.read(sample_idx).read(0)
+        hr_ref = self.dataset.read(sample_idx).read(1)
+
+        with rio.open(lr_ref) as src_lr, rio.open(hr_ref) as src_hr:
+            lr_data = src_lr.read(window=rio.windows.Window(0, 0, self.patch_size, self.patch_size))
+            hr_data = src_hr.read(window=rio.windows.Window(0, 0, self.hr_patch_size, self.hr_patch_size))
+
+        if self.color:
+            return self.to_tensor_rgb(lr_data), self.to_tensor_rgb(hr_data)
+        else:
+            return self.to_tensor_gray(lr_data), self.to_tensor_gray(hr_data)
+
+    def to_tensor_gray(self, data, norm=3000.0):
+        rgb = data[:3] / norm
+        gray = 0.2989 * rgb[0] + 0.5870 * rgb[1] + 0.1140 * rgb[2]
+        return torch.tensor(gray, dtype=torch.float32).unsqueeze(0)  # [1, H, W]
+
+    def to_tensor_rgb(self, data, norm=3000.0):
+        rgb = data[:3] / norm
+        return torch.tensor(rgb, dtype=torch.float32)  # [3, H, W]
+
+
+# ---------- 2. Model ----------
+class SRCNN(nn.Module):
+    def __init__(self, in_channels=1, out_channels=1):
+        super(SRCNN, self).__init__()
+        self.layer1 = nn.Conv2d(in_channels, 64, kernel_size=9, padding=4)
+        self.layer2 = nn.Conv2d(64, 32, kernel_size=1)
+        self.layer3 = nn.Conv2d(32, out_channels, kernel_size=5, padding=2)
+
+    def forward(self, x):
+        x = F.relu(self.layer1(x))
+        x = F.relu(self.layer2(x))
+        return self.layer3(x)
+
+
+# ---------- 3. Training ----------
+def compute_psnr(output, target, max_pixel=1.0):
+    mse = F.mse_loss(output, target)
+    return 100 if mse.item() == 0 else 20 * math.log10(max_pixel / math.sqrt(mse.item()))
+
+def train_model(model, dataloader, device, num_epochs=100, save_path="srcnn_model"):
+    print("Training")
+    criterion = nn.MSELoss()
+    perceptual_criterion = PerceptualLoss(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+    psnr_list = []
+    perceptual_loss_list = []
+
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        running_perceptual_loss = 0.0
+
+        for i, (lr, hr) in enumerate(dataloader):
+            lr, hr = lr.to(device), hr.to(device)
+            upsampled = F.interpolate(lr, scale_factor=4, mode='bicubic', align_corners=False)
+
+            optimizer.zero_grad()
+            output = model(upsampled)
+
+            # Compute both pixel and perceptual loss
+            l2_loss = criterion(output, hr)
+            perceptual_loss = perceptual_criterion(output, hr)
+            total_loss = l2_loss + 0.01 * perceptual_loss
+
+            total_loss.backward()
+            optimizer.step()
+
+            running_loss += total_loss.item()
+            running_perceptual_loss += perceptual_loss.item()
+
+            if (i + 1) % 100 == 0:
+                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}], Loss: {running_loss/100:.4f}")
+                running_loss = 0.0
+
+        psnr = compute_psnr(output, hr)
+        avg_perceptual_loss = running_perceptual_loss / (i + 1)
+        psnr_list.append(psnr)
+        perceptual_loss_list.append(avg_perceptual_loss)
+
+        print(f"Epoch [{epoch+1}], PSNR: {psnr:.2f} dB, Perceptual Loss: {avg_perceptual_loss:.6f}")
+
+        if (epoch + 1) % 5 == 0:
+            torch.save(model.state_dict(), f"{save_path}.pth")
+            print(f"Model saved as: {save_path}.pth")
+
+    # Plotting
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1)
+    plt.plot(range(1, num_epochs + 1), psnr_list, marker='o')
+    plt.title("PSNR over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("PSNR (dB)")
+    plt.grid(True)
+
+    plt.subplot(1,2,2)
+    plt.plot(range(1, num_epochs + 1), perceptual_loss_list, marker='o', color='orange')
+    plt.title("Perceptual Loss over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ---------- 4. Inference & Visualization ----------
+def test_random_sample(model, dataset, device, color=False):
+    model.eval()
+    idx = random.randint(0, len(dataset) - 1)
+    idx = 9
+    lr, hr = dataset[idx]
+    lr = lr.unsqueeze(0).to(device)
+    hr = hr.unsqueeze(0).to(device)
+
+    upsampled = F.interpolate(lr, scale_factor=4, mode='bicubic', align_corners=False)
+
+    with torch.no_grad():
+        sr = model(upsampled)
+
+    psnr = compute_psnr(sr, hr)
+    print(f"Test sample index {idx} | PSNR: {psnr:.2f} dB")
+
+    # Move to CPU and plot
+    def to_np(img):
+        return img.squeeze().cpu().numpy()
+
+    if color:
+        lr_np = np.transpose(to_np(lr), (1, 2, 0))
+        hr_np = np.transpose(to_np(hr), (1, 2, 0))
+        sr_np = np.transpose(to_np(sr), (1, 2, 0))
+    else:
+        lr_np = to_np(lr)
+        hr_np = to_np(hr)
+        sr_np = to_np(sr)
+
+    plt.figure(figsize=(15, 5))
+    titles = ['Low-Resolution (Input)', 'High-Resolution (Ground Truth)', 'SRCNN Output']
+    for i, img in enumerate([lr_np, hr_np, sr_np]):
+        plt.subplot(1, 3, i + 1)
+        plt.imshow(img, cmap=None if color else 'gray')
+        plt.title(titles[i])
+        plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+# ---------- 5. Entrypoint ----------
+def main(train=True, model_path="srcnn_model.pth", color=False):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    in_channels = 3 if color else 1
+    model = SRCNN(in_channels=in_channels, out_channels=in_channels).to(device)
+
+    if train:
+        train_dataset = Sen2NaipDataset(indices=range(100), color=color)
+        train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+        train_model(model, train_loader, device)
+    else:
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model weights not found at {model_path}")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+
+        test_dataset = Sen2NaipDataset(indices=range(10), color=color)
+        test_random_sample(model, test_dataset, device, color=color)
+
+
+# -------- Run here --------
+# main(train=True, color=True)  # To train with color
+main(train=True, color=True)   # To test with color images and show PSNR
