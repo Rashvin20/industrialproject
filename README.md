@@ -1,6 +1,6 @@
 # 🛰️ Satellite Image Super-Resolution with Deep Learning
 
-> Enhancing low-resolution satellite imagery using state-of-the-art super-resolution models: **SRCNN**, **EDSR**, and **ESRGAN**.
+> Enhancing low-resolution satellite imagery using  super-resolution models: **SRCNN**, **EDSR**, and **ESRGAN**.
 
 ---
 
@@ -20,7 +20,6 @@ This project aims to **bridge the resolution gap** using deep learning-based **S
 - ✅ Train and compare **SRCNN**, **EDSR**, and **ESRGAN** models for single-image super-resolution (SISR).
 - ✅ Apply models to real satellite image data and evaluate performance using **PSNR**, **SSIM**, and **perceptual loss**.
 - ✅ **Develop an interactive web interface** that allows users to upload low-resolution imagery and download super-resolved outputs in **GeoTIFF** format.
-- ✅ Support decision-making in large-scale real estate and environmental analysis through improved geospatial image clarity.
 
 ---
 
@@ -91,8 +90,6 @@ The interface allows users to:
 - Download results in **GeoTIFF** format for GIS compatibility
 
 ---
-
-## 📮 Contact
 
 Developed by Group 2  
 University College London (UCL)  
