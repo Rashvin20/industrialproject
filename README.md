@@ -91,7 +91,6 @@ The interface allows users to:
 
 ---
 
-Developed by Group 2 
 Meng Robotics and Ai
 University College London (UCL)  
 
