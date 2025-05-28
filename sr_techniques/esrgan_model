@@ -12,7 +12,7 @@ import math
 import os
 from torchvision.models import squeezenet1_0, SqueezeNet1_0_Weights
 
-# ---------- 1. Dataset (color) ----------
+# ---------- 1. Dataset (color) ---------
 class Sen2NaipDataset(Dataset):
     def __init__(self, split="tacofoundation:sen2naipv2-unet", indices=None, patch_size=64, scale=4):
         self.dataset = tacoreader.load(split)
