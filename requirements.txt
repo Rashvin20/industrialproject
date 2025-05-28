@@ -1,8 +1,10 @@
-torch>=1.13
-torchvision>=0.14
+torch
+torchvision
+streamlit
+Pillow
+rasterio
+tacoreader
 numpy
 matplotlib
 scikit-image
-rasterio
-tacoreader
 wandb
