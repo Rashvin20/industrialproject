@@ -85,8 +85,7 @@ streamlit run app.py
 ```
 
 The interface allows users to:
-- Upload low-resolution satellite images
-- Apply any of the trained models
+- Upload low-resolution satellite images  
 - Download results in **GeoTIFF** format for GIS compatibility
 
 ---
