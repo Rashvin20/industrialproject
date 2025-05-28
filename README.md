@@ -51,3 +51,49 @@ These are paired and aligned to train and evaluate the super-resolution models.
 git clone https://github.com/Rashvin20/industrialproject.git
 cd industrialproject
 pip install -r requirements.txt
+```
+
+---
+
+## ▶️ Running the Models
+
+Each model is located in the `sr_techniques/` folder. You can run them individually as follows:
+
+```bash
+cd sr_techniques
+
+# Run SRCNN
+python srcnn_model.py
+
+# Run EDSR
+python edsr_model.py
+
+# Run ESRGAN
+python esrgan_model.py
+```
+
+Model weights and training graphs (PSNR, SSIM, perceptual loss) are also saved in this folder.
+
+---
+
+## 🌐 Launching the Interface
+
+The Streamlit-based web interface is located in the `frontend/` folder. Launch it with:
+
+```bash
+cd frontend
+streamlit run app.py
+```
+
+The interface allows users to:
+- Upload low-resolution satellite images
+- Apply any of the trained models
+- Download results in **GeoTIFF** format for GIS compatibility
+
+---
+
+## 📮 Contact
+
+Developed by Group 2  
+University College London (UCL)  
+
